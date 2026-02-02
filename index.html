@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>إدخال نتائج على قالب Excel (Brutes/Traitées)</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width: 1100px; margin: 24px auto; padding: 0 12px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin: 12px 0; }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
+    input, select, button { padding: 10px; width: 100%; box-sizing: border-box; }
+    button { cursor: pointer; }
+    .muted { color:#666; font-size: 13px; }
+    .ok { color: #0a7a0a; }
+    .err { color: #b00020; }
+    #fields { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    @media (max-width: 900px) { #fields { grid-template-columns: 1fr; } .row{grid-template-columns: 1fr;} }
+    pre { background:#f7f7f7; padding:12px; border-radius:10px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h1>إدخال قيم على ملف Excel المعتمد</h1>
+  <p class="muted">
+    القالب يحتوي شيتين: Brutes و Traitées. اختر الشيت ثم رقم (B1/T1...) واملأ القيم، بعدها نزّل نسخة معدّلة.
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <button id="loadTemplateBtn">تحميل القالب تلقائيًا (template.xlsx)</button>
+        <div class="muted">يحتاج أن يكون <b>template.xlsx</b> بجانب index.html.</div>
+      </div>
+      <div>
+        <label>أو ارفع القالب يدويًا (Fallback)</label>
+        <input type="file" id="templateFileInput" accept=".xlsx,.xls" />
+      </div>
+    </div>
+    <div id="status" class="muted" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>اختيار الشيت</label>
+        <select id="sheetSelect" disabled></select>
+      </div>
+      <div>
+        <label>اختيار رقم العينة (N°=)</label>
+        <select id="idSelect" disabled></select>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <div>
+        <button id="prefillBtn" disabled>جلب القيم الحالية للصف (Prefill)</button>
+      </div>
+      <div>
+        <button id="clearBtn" disabled>تفريغ الحقول</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>الحقول</h3>
+    <div id="fields"></div>
+
+    <div class="row" style="margin-top:12px;">
+      <div>
+        <button id="saveBtn" disabled>حفظ القيم داخل القالب</button>
+      </div>
+      <div>
+        <button id="downloadBtn" disabled>تنزيل النسخة المعدّلة</button>
+      </div>
+    </div>
+
+    <div class="muted" style="margin-top:10px;">
+      ملاحظة: التنسيقات المعقدة قد لا تُحافظ 100% حسب المكتبة، لكن البيانات تُكتب بشكل صحيح.
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>سجل</h3>
+    <pre id="log"></pre>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script>
+    // ===== إعدادات القالب المتوقع (حسب ملفك) =====
+    const EXPECTED_HEADERS = [
+      "N°=",
+      "Point de prélevement",
+      "Centre",
+      "Communes",
+      "Date",
+      "Couleur",
+      "Temp.",
+      "Cond.",
+      "Saliniré",
+      "TDS",
+      "Turbidité",
+      "pH",
+      "RS",
+      "MO",
+      "Calcium",
+      "Dureté T",
+      "Magnésium",
+      "Sodium",
+      "Potassium",
+      "Ammonium",
+      "Nitrites",
+      "Nitrates",
+      "Phosphates",
+      "Chlorures",
+      "Alcalinité",
+      "Bicarbonate",
+      "Sulfates",
+      "Fer total",
+      "Manganèse",
+      "Aluminium"
+    ];
+
+    const NUMERIC_HEADERS = new Set([
+      "Temp.","Cond.","Saliniré","TDS","Turbidité","pH","RS","MO","Calcium","Dureté T",
+      "Magnésium","Sodium","Potassium","Ammonium","Nitrites","Nitrates","Phosphates",
+      "Chlorures","Alcalinité","Bicarbonate","Sulfates","Fer total","Manganèse","Aluminium"
+    ]);
+
+    const TEMPLATE_URL = "./template.xlsx";
+
+    // ===== عناصر الصفحة =====
+    const loadTemplateBtn = document.getElementById("loadTemplateBtn");
+    const templateFileInput = document.getElementById("templateFileInput");
+    const sheetSelect = document.getElementById("sheetSelect");
+    const idSelect = document.getElementById("idSelect");
+    const fieldsDiv = document.getElementById("fields");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const prefillBtn = document.getElementById("prefillBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const saveBtn = document.getElementById("saveBtn");
+    const downloadBtn = document.getElementById("downloadBtn");
+
+    let workbook = null;
+    let currentHeaders = null; // headers row 2
+    let currentSheetName = null;
+    let currentId = null;
+    let outputName = "Résultats_Physico_Chimique_2025_modified.xlsx";
+
+    function log(msg) { logEl.textContent += msg + "\\n"; }
+    function setStatus(msg, kind="muted") {
+      statusEl.className = kind;
+      statusEl.textContent = msg;
+    }
+
+    function enableUI(enabled) {
+      sheetSelect.disabled = !enabled;
+      idSelect.disabled = !enabled;
+      prefillBtn.disabled = !enabled;
+      clearBtn.disabled = !enabled;
+      saveBtn.disabled = !enabled;
+      downloadBtn.disabled = !enabled;
+    }
+
+    function readWorkbookFromArrayBuffer(arrayBuffer) {
+      workbook = XLSX.read(arrayBuffer, { type: "array", cellDates: true });
+      log("SheetNames: " + workbook.SheetNames.join(", "));
+      // تحضير اختيار الشيت
+      sheetSelect.innerHTML = "";
+      workbook.SheetNames.forEach(n => {
+        const opt = document.createElement("option");
+        opt.value = n; opt.textContent = n;
+        sheetSelect.appendChild(opt);
+      });
+      sheetSelect.value = workbook.SheetNames[0] || "";
+      currentSheetName = sheetSelect.value;
+
+      setStatus("تم تحميل القالب بنجاح ✅", "ok");
+      enableUI(true);
+      onSheetChange(); // بناء الفورم + الأكواد
+    }
+
+    async function loadTemplateViaFetch() {
+      setStatus("جاري تحميل template.xlsx ...");
+      try {
+        const res = await fetch(TEMPLATE_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const buf = await res.arrayBuffer();
+        outputName = "template_modified.xlsx";
+        readWorkbookFromArrayBuffer(buf);
+      } catch (e) {
+        setStatus("فشل التحميل التلقائي. استخدم رفع القالب يدويًا من الأعلى.", "err");
+        log("Fetch failed: " + e.message);
+      }
+    }
+
+    loadTemplateBtn.addEventListener("click", loadTemplateViaFetch);
+
+    templateFileInput.addEventListener("change", async (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      setStatus("جاري قراءة القالب...");
+      const buf = await f.arrayBuffer();
+      outputName = f.name.replace(/\\.(xlsx|xls)$/i, "") + "_modified.xlsx";
+      readWorkbookFromArrayBuffer(buf);
+    });
+
+    sheetSelect.addEventListener("change", () => {
+      currentSheetName = sheetSelect.value;
+      onSheetChange();
+    });
+
+    idSelect.addEventListener("change", () => {
+      currentId = idSelect.value;
+    });
+
+    function getCellValue(ws, r, c) {
+      const addr = XLSX.utils.encode_cell({ r: r-1, c: c-1 }); // 0-based
+      const cell = ws[addr];
+      return cell ? cell.v : "";
+    }
+
+    function setCellValue(ws, r, c, value, typeHint=null) {
+      const addr = XLSX.utils.encode_cell({ r: r-1, c: c-1 });
+      if (value === "" || value === null || typeof value === "undefined") {
+        ws[addr] = { t: "s", v: "" };
+        return;
+      }
+
+      if (typeHint === "date") {
+        const d = (value instanceof Date) ? value : new Date(value);
+        if (!isNaN(d.getTime())) ws[addr] = { t: "d", v: d };
+        else ws[addr] = { t: "s", v: String(value) };
+        return;
+      }
+
+      if (typeHint === "number") {
+        const num = Number(value);
+        if (!Number.isNaN(num)) ws[addr] = { t: "n", v: num };
+        else ws[addr] = { t: "s", v: String(value) };
+        return;
+      }
+
+      ws[addr] = { t: "s", v: String(value) };
+    }
+
+    function validateHeaders(headers) {
+      if (!headers || headers.length < EXPECTED_HEADERS.length) return false;
+      for (let i = 0; i < EXPECTED_HEADERS.length; i++) {
+        if ((headers[i] ?? "").toString().trim() !== EXPECTED_HEADERS[i]) return false;
+      }
+      return true;
+    }
+
+    function getHeadersRow2(ws) {
+      const headers = [];
+      for (let c = 1; c <= EXPECTED_HEADERS.length; c++) headers.push(getCellValue(ws, 2, c));
+      return headers;
+    }
+
+    function listIds(ws) {
+      const ids = [];
+      let r = 3;
+      while (r < 2000) {
+        const v = getCellValue(ws, r, 1);
+        if (v === "" || v === null || typeof v === "undefined") break;
+        ids.push(String(v));
+        r++;
+      }
+      return ids;
+    }
+
+    function findRowById(ws, id) {
+      let r = 3;
+      while (r < 2000) {
+        const v = getCellValue(ws, r, 1);
+        if (v === "" || v === null || typeof v === "undefined") break;
+        if (String(v) === String(id)) return r;
+        r++;
+      }
+      return null;
+    }
+
+    function buildFields(headers) {
+      fieldsDiv.innerHTML = "";
+      for (let i = 1; i < headers.length; i++) {
+        const h = headers[i];
+        const wrap = document.createElement("div");
+        const lab = document.createElement("label");
+        lab.textContent = h;
+
+        const inp = document.createElement("input");
+        inp.id = "f_" + i;
+        inp.placeholder = h;
+
+        if (h === "Date") inp.type = "date";
+        else if (NUMERIC_HEADERS.has(h)) { inp.type = "number"; inp.step = "any"; }
+        else inp.type = "text";
+
+        wrap.appendChild(lab);
+        wrap.appendChild(inp);
+        fieldsDiv.appendChild(wrap);
+      }
+    }
+
+    function clearFields() {
+      fieldsDiv.querySelectorAll("input").forEach(i => i.value = "");
+      log("Fields cleared");
+    }
+
+    function prefillFromRow() {
+      const ws = workbook.Sheets[currentSheetName];
+      const row = findRowById(ws, currentId);
+      if (!row) return alert("لم يتم العثور على هذا الرقم في العمود A");
+
+      for (let i = 1; i < currentHeaders.length; i++) {
+        const header = currentHeaders[i];
+        const col = i + 1;
+        const v = getCellValue(ws, row, col);
+        const inp = document.getElementById("f_" + i);
+        if (!inp) continue;
+
+        if (header === "Date") {
+          const d = (v instanceof Date) ? v : new Date(v);
+          if (!isNaN(d.getTime())) {
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth()+1).padStart(2,"0");
+            const dd = String(d.getDate()).padStart(2,"0");
+            inp.value = `${yyyy}-${mm}-${dd}`;
+          } else inp.value = "";
+        } else {
+          inp.value = (v ?? "");
+        }
+      }
+      log(`Prefilled from ${currentSheetName} / ${currentId} (row ${row})`);
+    }
+
+    function saveToRow() {
+      const ws = workbook.Sheets[currentSheetName];
+      const row = findRowById(ws, currentId);
+      if (!row) return alert("لم يتم العثور على هذا الرقم في العمود A");
+
+      for (let i = 1; i < currentHeaders.length; i++) {
+        const header = currentHeaders[i];
+        const col = i + 1;
+        const inp = document.getElementById("f_" + i);
+        if (!inp) continue;
+        const val = inp.value;
+
+        if (header === "Date") setCellValue(ws, row, col, val, "date");
+        else if (NUMERIC_HEADERS.has(header)) setCellValue(ws, row, col, val === "" ? "" : val, "number");
+        else setCellValue(ws, row, col, val, "text");
+      }
+
+      setStatus(`تم حفظ القيم داخل الصف ${currentId} في الشيت ${currentSheetName} ✅`, "ok");
+      log(`Saved to ${currentSheetName} / ${currentId} (row ${row})`);
+    }
+
+    function onSheetChange() {
+      const ws = workbook.Sheets[currentSheetName];
+      const headers = getHeadersRow2(ws);
+      if (!validateHeaders(headers)) {
+        setStatus("تحذير: رؤوس الأعمدة لا تطابق القالب المتوقع. تأكد أنك تستخدم نفس ملف القالب.", "err");
+        log("Header mismatch: " + JSON.stringify(headers));
+      } else {
+        setStatus("القالب مطابق ✅", "ok");
+      }
+
+      currentHeaders = headers;
+      buildFields(currentHeaders);
+
+      const ids = listIds(ws);
+      idSelect.innerHTML = "";
+      ids.forEach(id => {
+        const opt = document.createElement("option");
+        opt.value = id; opt.textContent = id;
+        idSelect.appendChild(opt);
+      });
+      currentId = ids[0] || "";
+      idSelect.value = currentId;
+
+      log(`Sheet changed: ${currentSheetName} (IDs: ${ids.length})`);
+    }
+
+    prefillBtn.addEventListener("click", prefillFromRow);
+    clearBtn.addEventListener("click", clearFields);
+    saveBtn.addEventListener("click", saveToRow);
+
+    downloadBtn.addEventListener("click", () => {
+      const wbout = XLSX.write(workbook, { bookType: "xlsx", type: "array", cellDates: true });
+      const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = outputName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      log("Downloaded: " + outputName);
+    });
+
+    enableUI(false);
+    sheetSelect.innerHTML = "<option>حمّل القالب أولاً</option>";
+    idSelect.innerHTML = "<option>حمّل القالب أولاً</option>";
+    setStatus("ابدأ بتحميل القالب تلقائيًا أو رفعه يدويًا.");
+  </script>
+</body>
+</html>
